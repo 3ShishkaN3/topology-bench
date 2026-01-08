@@ -1,3 +1,4 @@
+shishka@k3s-master-sakhalin:~$ cat bench.yaml
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -25,18 +26,6 @@ spec:
         image: vimagick/tinyproxy
         ports:
         - containerPort: 8888
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: proxy-svc
-  namespace: mcp-bench
-spec:
-  selector:
-    app: proxy
-  ports:
-    - port: 8888
-      targetPort: 8888
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -99,36 +88,34 @@ spec:
   containers:
   - name: runner
     image: python:3.11-slim
-    envFrom:
-    - secretRef:
-        name: google-api
-    env:
-    - name: PROXY_URL
-      value: "http://proxy-svc.mcp-bench.svc.cluster.local:8888"
-    - name: TOOL_URL
-      value: "http://tool-sakhalin-svc.mcp-bench.svc.cluster.local"
     command: ["/bin/sh", "-c"]
     args:
       - |
-        pip install google-generativeai httpx tabulate -q
+        pip install google-generativeai httpx tabulate numpy matplotlib -q
         sleep 10
         cat <<EOF > benchmark.py
-        import time, asyncio, os, httpx, google.generativeai as genai
+        import time, asyncio, os, httpx
+        import google.generativeai as genai
+        import numpy as np
+        import matplotlib.pyplot as plt
         from tabulate import tabulate
-        from google.api_core import exceptions
 
-        PROXY_URL = os.environ["PROXY_URL"]
+        KEYS = [
+            "key1",
+            "key2",
+            "key3" # Захардкожено
+        ]
+
+        PROXY_URL = "http://proxy-svc.mcp-bench.svc.cluster.local:8888"
+        TOOL_URL = "http://tool-sakhalin-svc.mcp-bench.svc.cluster.local"
+
         os.environ["HTTPS_PROXY"] = PROXY_URL
         os.environ["HTTP_PROXY"] = PROXY_URL
-        TOOL_URL = os.environ["TOOL_URL"]
 
-        genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
-
-        def check_health():
-            """Check system health."""
-            return True
-
-        model = genai.GenerativeModel("models/gemini-1.5-flash", tools=[check_health])
+        def get_model(iter_idx):
+            key = KEYS[(iter_idx // 10) % len(KEYS)]
+            genai.configure(api_key=key)
+            return genai.GenerativeModel("models/gemini-2.0-flash-exp")
 
         async def topo_1x1_atomic():
             s = time.perf_counter()
@@ -146,7 +133,7 @@ spec:
                 tasks = [c.get(TOOL_URL + "/status") for _ in range(15)]
                 s = time.perf_counter()
                 await asyncio.gather(*tasks)
-                return ((time.perf_counter() - s) * 1000)
+                return (time.perf_counter() - s) * 1000
 
         async def topo_NxM_mesh():
             async with httpx.AsyncClient(proxy=PROXY_URL, trust_env=False, timeout=15.0) as c:
@@ -154,36 +141,53 @@ spec:
                 await c.get(TOOL_URL + "/status")
                 return (time.perf_counter() - s) * 1000
 
-        async def call_llm():
-            try:
-                t0 = time.perf_counter()
-                await model.generate_content_async("Check health.")
-                return time.perf_counter() - t0
-            except:
-                await asyncio.sleep(1.0)
-                return 1.0
-
         async def run():
             results = {"1x1": [], "1xM": [], "Nx1": [], "NxM": []}
-            for i in range(5):
-                llm_t = await call_llm()
-                l1 = await topo_1x1_atomic()
-                l2 = await topo_1xM_hub()
-                l3 = await topo_Nx1_competing()
-                l4 = await topo_NxM_mesh()
-                results["1x1"].append(l1); results["1xM"].append(l2)
-                results["Nx1"].append(l3); results["NxM"].append(l4)
-                print(f"Iter {i} done")
+            print(f"Starting 30 iterations (3 keys x 10 requests)...")
 
-            avg = lambda x: sum(x)/len(x)
-            base = avg(results["1x1"])
-            data = [
-                ["1x1 Atomic", f"{base:.2f}", "1.0x", "Local"],
-                ["1xM Hub", f"{avg(results['1xM']):.2f}", f"{avg(results['1xM'])/base:.1f}x", "MOW-SAK"],
-                ["Nx1 Compete", f"{avg(results['Nx1']):.2f}", f"{avg(results['Nx1'])/base:.1f}x", "Load"],
-                ["NxM Mesh", f"{avg(results['NxM']):.2f}", f"{avg(results['NxM'])/base:.1f}x", "MOW-FRA-SAK"]
-            ]
-            print("\n" + tabulate(data, headers=["Topology", "Latency (ms)", "Factor", "Path"], tablefmt="grid"))
+            for i in range(30):
+                model = get_model(i)
+                try:
+                    await model.generate_content_async("ping")
+                except:
+                    pass
+
+                results["1x1"].append(await topo_1x1_atomic())
+                results["1xM"].append(await topo_1xM_hub())
+                results["Nx1"].append(await topo_Nx1_competing())
+                results["NxM"].append(await topo_NxM_mesh())
+                if (i + 1) % 5 == 0: print(f"Progress: {i+1}/30")
+
+            table_data = []
+            base_mean = np.mean(results["1x1"])
+            for key in ["1x1", "1xM", "Nx1", "NxM"]:
+                d = results[key]
+                table_data.append([
+                    key, f"{np.mean(d):.2f}", f"{np.median(d):.2f}",
+                    f"{np.std(d):.2f}", f"{np.percentile(d, 90):.2f}",
+                    f"{np.percentile(d, 99):.2f}", f"{np.mean(d)/base_mean:.1f}x"
+                ])
+
+            print("\n" + tabulate(table_data,
+                headers=["Topo", "Mean", "Median", "Std", "P90", "P99", "Factor"],
+                tablefmt="grid"))
+
+            plt.figure(figsize=(12, 6))
+            for key in results:
+                plt.plot(results[key], label=key, marker='o', markersize=4)
+            plt.title("Latency Distribution (30 Iters, Gemini 2.0 Flash)")
+            plt.ylabel("Latency (ms)")
+            plt.xlabel("Iteration")
+            plt.yscale('log')
+            plt.legend()
+            plt.grid(True, which="both", ls="-", alpha=0.5)
+            plt.savefig('/tmp/bench.png')
+
+            print("\n" + "="*50)
+            print("ЭКСПЕРИМЕНТ ЗАВЕРШЕН")
+            print("Запустите эту команду на своем компьютере, чтобы забрать график:")
+            print("kubectl cp mcp-bench/bench-runner:/tmp/bench.png ./bench_results.png")
+            print("="*50 + "\n")
 
         asyncio.run(run())
         EOF
