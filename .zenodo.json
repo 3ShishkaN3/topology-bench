@@ -1,0 +1,20 @@
+{
+  "title": "MCP Bench: Distributed LLM Tool-Call Latency Benchmark",
+  "upload_type": "software",
+  "description": "Reproducible benchmark for evaluating LLM tool-call latency across geographically distributed k3s Kubernetes clusters.",
+  "creators": [
+    {
+      "name": "Reznik, Danil",
+      "orcid": "0000-0000-0000-0000"
+    }
+  ],
+  "keywords": [
+    "LLM",
+    "Benchmark",
+    "Kubernetes",
+    "k3s",
+    "Latency",
+    "Distributed Systems"
+  ],
+  "license": "MIT"
+}
