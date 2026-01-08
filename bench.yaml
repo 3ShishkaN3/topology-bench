@@ -1,0 +1,191 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mcp-bench
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: egress-proxy
+  namespace: mcp-bench
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: proxy
+  template:
+    metadata:
+      labels:
+        app: proxy
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: k3s-worker-frankfurt
+      containers:
+      - name: tinyproxy
+        image: vimagick/tinyproxy
+        ports:
+        - containerPort: 8888
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: proxy-svc
+  namespace: mcp-bench
+spec:
+  selector:
+    app: proxy
+  ports:
+    - port: 8888
+      targetPort: 8888
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tool-sakhalin
+  namespace: mcp-bench
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tool-remote
+  template:
+    metadata:
+      labels:
+        app: tool-remote
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: k3s-master-sakhalin
+      tolerations:
+      - operator: "Exists"
+      containers:
+      - name: server
+        image: python:3.11-slim
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            pip install fastapi uvicorn -q
+            cat <<EOF > main.py
+            from fastapi import FastAPI
+            import asyncio
+            app = FastAPI()
+            @app.get("/status")
+            async def status():
+                await asyncio.sleep(0.01)
+                return {"status": "ok"}
+            EOF
+            uvicorn main:app --host 0.0.0.0 --port 8000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tool-sakhalin-svc
+  namespace: mcp-bench
+spec:
+  selector:
+    app: tool-remote
+  ports:
+    - port: 80
+      targetPort: 8000
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bench-runner
+  namespace: mcp-bench
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/hostname: k3s-worker-moscow
+  containers:
+  - name: runner
+    image: python:3.11-slim
+    envFrom:
+    - secretRef:
+        name: google-api
+    env:
+    - name: PROXY_URL
+      value: "http://proxy-svc.mcp-bench.svc.cluster.local:8888"
+    - name: TOOL_URL
+      value: "http://tool-sakhalin-svc.mcp-bench.svc.cluster.local"
+    command: ["/bin/sh", "-c"]
+    args:
+      - |
+        pip install google-generativeai httpx tabulate -q
+        sleep 10
+        cat <<EOF > benchmark.py
+        import time, asyncio, os, httpx, google.generativeai as genai
+        from tabulate import tabulate
+        from google.api_core import exceptions
+
+        PROXY_URL = os.environ["PROXY_URL"]
+        os.environ["HTTPS_PROXY"] = PROXY_URL
+        os.environ["HTTP_PROXY"] = PROXY_URL
+        TOOL_URL = os.environ["TOOL_URL"]
+
+        genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
+
+        def check_health():
+            """Check system health."""
+            return True
+
+        model = genai.GenerativeModel("models/gemini-1.5-flash", tools=[check_health])
+
+        async def topo_1x1_atomic():
+            s = time.perf_counter()
+            await asyncio.sleep(0.001)
+            return (time.perf_counter() - s) * 1000
+
+        async def topo_1xM_hub():
+            async with httpx.AsyncClient(trust_env=False) as c:
+                s = time.perf_counter()
+                await c.get(TOOL_URL + "/status")
+                return (time.perf_counter() - s) * 1000
+
+        async def topo_Nx1_competing():
+            async with httpx.AsyncClient(trust_env=False) as c:
+                tasks = [c.get(TOOL_URL + "/status") for _ in range(15)]
+                s = time.perf_counter()
+                await asyncio.gather(*tasks)
+                return ((time.perf_counter() - s) * 1000)
+
+        async def topo_NxM_mesh():
+            async with httpx.AsyncClient(proxy=PROXY_URL, trust_env=False, timeout=15.0) as c:
+                s = time.perf_counter()
+                await c.get(TOOL_URL + "/status")
+                return (time.perf_counter() - s) * 1000
+
+        async def call_llm():
+            try:
+                t0 = time.perf_counter()
+                await model.generate_content_async("Check health.")
+                return time.perf_counter() - t0
+            except:
+                await asyncio.sleep(1.0)
+                return 1.0
+
+        async def run():
+            results = {"1x1": [], "1xM": [], "Nx1": [], "NxM": []}
+            for i in range(5):
+                llm_t = await call_llm()
+                l1 = await topo_1x1_atomic()
+                l2 = await topo_1xM_hub()
+                l3 = await topo_Nx1_competing()
+                l4 = await topo_NxM_mesh()
+                results["1x1"].append(l1); results["1xM"].append(l2)
+                results["Nx1"].append(l3); results["NxM"].append(l4)
+                print(f"Iter {i} done")
+
+            avg = lambda x: sum(x)/len(x)
+            base = avg(results["1x1"])
+            data = [
+                ["1x1 Atomic", f"{base:.2f}", "1.0x", "Local"],
+                ["1xM Hub", f"{avg(results['1xM']):.2f}", f"{avg(results['1xM'])/base:.1f}x", "MOW-SAK"],
+                ["Nx1 Compete", f"{avg(results['Nx1']):.2f}", f"{avg(results['Nx1'])/base:.1f}x", "Load"],
+                ["NxM Mesh", f"{avg(results['NxM']):.2f}", f"{avg(results['NxM'])/base:.1f}x", "MOW-FRA-SAK"]
+            ]
+            print("\n" + tabulate(data, headers=["Topology", "Latency (ms)", "Factor", "Path"], tablefmt="grid"))
+
+        asyncio.run(run())
+        EOF
+        python benchmark.py
+        sleep 3600
