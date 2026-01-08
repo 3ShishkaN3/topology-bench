@@ -1,4 +1,3 @@
-shishka@k3s-master-sakhalin:~$ cat bench.yaml
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -27,51 +26,255 @@ spec:
         ports:
         - containerPort: 8888
 ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: proxy-svc
+  namespace: mcp-bench
+spec:
+  selector:
+    app: proxy
+  ports:
+    - port: 8888
+      targetPort: 8888
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: tool-sakhalin
+  name: mcp-server-sakhalin
   namespace: mcp-bench
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: tool-remote
+      app: mcp-server
   template:
     metadata:
       labels:
-        app: tool-remote
+        app: mcp-server
     spec:
       nodeSelector:
         kubernetes.io/hostname: k3s-master-sakhalin
       tolerations:
       - operator: "Exists"
       containers:
-      - name: server
+      - name: mcp-server
         image: python:3.11-slim
         command: ["/bin/sh", "-c"]
         args:
           - |
-            pip install fastapi uvicorn -q
-            cat <<EOF > main.py
-            from fastapi import FastAPI
+            pip install mcp httpx uvicorn starlette sse-starlette -q
+            cat <<'EOF' > mcp_server.py
             import asyncio
-            app = FastAPI()
-            @app.get("/status")
-            async def status():
-                await asyncio.sleep(0.01)
-                return {"status": "ok"}
+            import json
+            from datetime import datetime
+            from starlette.applications import Starlette
+            from starlette.routing import Route
+            from starlette.responses import Response
+            from sse_starlette.sse import EventSourceResponse
+            
+            class MCPServer:
+                def __init__(self):
+                    self.tools = [
+                        {
+                            "name": "get_system_status",
+                            "description": "Get current system status with timestamp",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "detail_level": {
+                                        "type": "string",
+                                        "enum": ["basic", "detailed"],
+                                        "description": "Level of detail in response"
+                                    }
+                                },
+                                "required": []
+                            }
+                        },
+                        {
+                            "name": "calculate_metric",
+                            "description": "Calculate latency metric with artificial delay",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "delay_ms": {
+                                        "type": "number",
+                                        "description": "Artificial processing delay in milliseconds"
+                                    }
+                                },
+                                "required": ["delay_ms"]
+                            }
+                        }
+                    ]
+                
+                async def handle_initialize(self, params):
+                    return {
+                        "protocolVersion": "2024-11-05",
+                        "serverInfo": {
+                            "name": "mcp-benchmark-server",
+                            "version": "1.0.0"
+                        },
+                        "capabilities": {
+                            "tools": {}
+                        }
+                    }
+                
+                async def handle_tools_list(self, params):
+                    return {"tools": self.tools}
+                
+                async def handle_tools_call(self, params):
+                    tool_name = params.get("name")
+                    arguments = params.get("arguments", {})
+                    
+                    if tool_name == "get_system_status":
+                        detail = arguments.get("detail_level", "basic")
+                        await asyncio.sleep(0.01)
+                        
+                        result = {
+                            "status": "operational",
+                            "timestamp": datetime.utcnow().isoformat(),
+                            "location": "Sakhalin",
+                            "uptime_seconds": 3600
+                        }
+                        
+                        if detail == "detailed":
+                            result.update({
+                                "cpu_percent": 23.5,
+                                "memory_mb": 512,
+                                "active_connections": 5
+                            })
+                        
+                        return {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": json.dumps(result, indent=2)
+                                }
+                            ]
+                        }
+                    
+                    elif tool_name == "calculate_metric":
+                        delay = arguments.get("delay_ms", 10) / 1000
+                        await asyncio.sleep(delay)
+                        
+                        return {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": json.dumps({
+                                        "computed_value": 42.0,
+                                        "processing_time_ms": delay * 1000,
+                                        "timestamp": datetime.utcnow().isoformat()
+                                    }, indent=2)
+                                }
+                            ]
+                        }
+                    
+                    else:
+                        raise ValueError(f"Unknown tool: {tool_name}")
+                
+                async def handle_request(self, request_data):
+                    method = request_data.get("method")
+                    params = request_data.get("params", {})
+                    request_id = request_data.get("id")
+                    
+                    handlers = {
+                        "initialize": self.handle_initialize,
+                        "tools/list": self.handle_tools_list,
+                        "tools/call": self.handle_tools_call
+                    }
+                    
+                    if method not in handlers:
+                        return {
+                            "jsonrpc": "2.0",
+                            "id": request_id,
+                            "error": {
+                                "code": -32601,
+                                "message": f"Method not found: {method}"
+                            }
+                        }
+                    
+                    try:
+                        result = await handlers[method](params)
+                        return {
+                            "jsonrpc": "2.0",
+                            "id": request_id,
+                            "result": result
+                        }
+                    except Exception as e:
+                        return {
+                            "jsonrpc": "2.0",
+                            "id": request_id,
+                            "error": {
+                                "code": -32603,
+                                "message": str(e)
+                            }
+                        }
+            
+            server = MCPServer()
+            
+            async def mcp_sse_endpoint(request):
+                async def event_generator():
+                    body = await request.body()
+                    
+                    try:
+                        request_data = json.loads(body)
+                        response = await server.handle_request(request_data)
+                        yield {"data": json.dumps(response)}
+                    except json.JSONDecodeError:
+                        yield {
+                            "data": json.dumps({
+                                "jsonrpc": "2.0",
+                                "error": {"code": -32700, "message": "Parse error"}
+                            })
+                        }
+                
+                return EventSourceResponse(event_generator())
+            
+            async def mcp_post_endpoint(request):
+                body = await request.body()
+                try:
+                    request_data = json.loads(body)
+                    response = await server.handle_request(request_data)
+                    return Response(
+                        content=json.dumps(response),
+                        media_type="application/json"
+                    )
+                except json.JSONDecodeError:
+                    return Response(
+                        content=json.dumps({
+                            "jsonrpc": "2.0",
+                            "error": {"code": -32700, "message": "Parse error"}
+                        }),
+                        status_code=400,
+                        media_type="application/json"
+                    )
+            
+            async def health_check(request):
+                return Response(content='{"status": "ok"}', media_type="application/json")
+            
+            app = Starlette(routes=[
+                Route("/mcp", mcp_post_endpoint, methods=["POST"]),
+                Route("/mcp/sse", mcp_sse_endpoint, methods=["POST"]),
+                Route("/health", health_check, methods=["GET"])
+            ])
+            
+            if __name__ == "__main__":
+                import uvicorn
+                uvicorn.run(app, host="0.0.0.0", port=8000)
             EOF
-            uvicorn main:app --host 0.0.0.0 --port 8000
+            python mcp_server.py
+        ports:
+        - containerPort: 8000
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: tool-sakhalin-svc
+  name: mcp-server-svc
   namespace: mcp-bench
 spec:
   selector:
-    app: tool-remote
+    app: mcp-server
   ports:
     - port: 80
       targetPort: 8000
@@ -88,108 +291,257 @@ spec:
   containers:
   - name: runner
     image: python:3.11-slim
+    env:
+    - name: GEMINI_API_KEY_1
+      value: "YOUR_KEY_1" 
+    - name: GEMINI_API_KEY_2
+      value: "YOUR_KEY_2"
+    - name: GEMINI_API_KEY_3
+      value: "YOUR_KEY_3"
     command: ["/bin/sh", "-c"]
     args:
       - |
-        pip install google-generativeai httpx tabulate numpy matplotlib -q
+        pip install google-genai httpx tabulate numpy matplotlib -q
         sleep 10
-        cat <<EOF > benchmark.py
-        import time, asyncio, os, httpx
-        import google.generativeai as genai
+        
+        cat <<'EOF' > benchmark.py
+        import time
+        import asyncio
+        import os
+        import httpx
+        import json
         import numpy as np
         import matplotlib.pyplot as plt
         from tabulate import tabulate
-
+        from google import genai
+        from google.genai import types
+        
         KEYS = [
-            "key1",
-            "key2",
-            "key3" # Захардкожено
+            os.getenv("GEMINI_API_KEY_1"),
+            os.getenv("GEMINI_API_KEY_2"),
+            os.getenv("GEMINI_API_KEY_3")
         ]
-
+        
         PROXY_URL = "http://proxy-svc.mcp-bench.svc.cluster.local:8888"
-        TOOL_URL = "http://tool-sakhalin-svc.mcp-bench.svc.cluster.local"
-
-        os.environ["HTTPS_PROXY"] = PROXY_URL
-        os.environ["HTTP_PROXY"] = PROXY_URL
-
-        def get_model(iter_idx):
-            key = KEYS[(iter_idx // 10) % len(KEYS)]
-            genai.configure(api_key=key)
-            return genai.GenerativeModel("models/gemini-2.0-flash-exp")
-
+        MCP_SERVER_URL = "http://mcp-server-svc.mcp-bench.svc.cluster.local/mcp"
+        
+        class MCPClient:
+            def __init__(self, base_url, proxy=None):
+                self.base_url = base_url
+                self.proxy = proxy
+                self.session_id = 0
+            
+            async def call_tool(self, tool_name, arguments, timeout=15.0):
+                """Call MCP tool via JSON-RPC 2.0"""
+                self.session_id += 1
+                
+                request = {
+                    "jsonrpc": "2.0",
+                    "id": self.session_id,
+                    "method": "tools/call",
+                    "params": {
+                        "name": tool_name,
+                        "arguments": arguments
+                    }
+                }
+                
+                client_kwargs = {"timeout": timeout}
+                if self.proxy:
+                    client_kwargs["proxy"] = self.proxy
+                
+                async with httpx.AsyncClient(**client_kwargs) as client:
+                    response = await client.post(
+                        self.base_url,
+                        json=request,
+                        headers={"Content-Type": "application/json"}
+                    )
+                    return response.json()
+        
         async def topo_1x1_atomic():
-            s = time.perf_counter()
+            """1x1: Local computation (baseline)"""
+            start = time.perf_counter()
             await asyncio.sleep(0.001)
-            return (time.perf_counter() - s) * 1000
-
-        async def topo_1xM_hub():
-            async with httpx.AsyncClient(trust_env=False) as c:
-                s = time.perf_counter()
-                await c.get(TOOL_URL + "/status")
-                return (time.perf_counter() - s) * 1000
-
-        async def topo_Nx1_competing():
-            async with httpx.AsyncClient(trust_env=False) as c:
-                tasks = [c.get(TOOL_URL + "/status") for _ in range(15)]
-                s = time.perf_counter()
-                await asyncio.gather(*tasks)
-                return (time.perf_counter() - s) * 1000
-
-        async def topo_NxM_mesh():
-            async with httpx.AsyncClient(proxy=PROXY_URL, trust_env=False, timeout=15.0) as c:
-                s = time.perf_counter()
-                await c.get(TOOL_URL + "/status")
-                return (time.perf_counter() - s) * 1000
-
+            return (time.perf_counter() - start) * 1000
+        
+        async def topo_1xM_hub(client):
+            """1xM: Single agent → direct MCP server call"""
+            start = time.perf_counter()
+            await client.call_tool("get_system_status", {"detail_level": "basic"})
+            return (time.perf_counter() - start) * 1000
+        
+        async def topo_Nx1_competing(client):
+            """Nx1: Multiple concurrent requests to one server"""
+            tasks = [
+                client.call_tool("calculate_metric", {"delay_ms": 10})
+                for _ in range(15)
+            ]
+            start = time.perf_counter()
+            await asyncio.gather(*tasks)
+            return (time.perf_counter() - start) * 1000
+        
+        async def topo_NxM_mesh(client_with_proxy):
+            """NxM: Request through proxy (Moscow → Frankfurt → Sakhalin)"""
+            start = time.perf_counter()
+            await client_with_proxy.call_tool("get_system_status", {"detail_level": "detailed"})
+            return (time.perf_counter() - start) * 1000
+        
+        async def test_llm_tool_calling(api_key, client):
+            """Test real LLM tool calling via Gemini"""
+            try:
+                genai_client = genai.Client(api_key=api_key)
+                
+                tool = types.Tool(
+                    function_declarations=[
+                        types.FunctionDeclaration(
+                            name="get_system_status",
+                            description="Get current system status",
+                            parameters={
+                                "type": "object",
+                                "properties": {
+                                    "detail_level": {
+                                        "type": "string",
+                                        "enum": ["basic", "detailed"]
+                                    }
+                                }
+                            }
+                        )
+                    ]
+                )
+                
+                response = genai_client.models.generate_content(
+                    model='gemini-2.0-flash-exp',
+                    contents="Check the system status with basic detail level",
+                    config=types.GenerateContentConfig(
+                        tools=[tool],
+                        temperature=0
+                    )
+                )
+                
+                if response.candidates[0].content.parts[0].function_call:
+                    fc = response.candidates[0].content.parts[0].function_call
+                    
+                    start = time.perf_counter()
+                    result = await client.call_tool(fc.name, dict(fc.args))
+                    latency = (time.perf_counter() - start) * 1000
+                    
+                    return True, latency
+                else:
+                    return False, 0
+                    
+            except Exception as e:
+                print(f"LLM test error: {e}")
+                return False, 0
+        
         async def run():
-            results = {"1x1": [], "1xM": [], "Nx1": [], "NxM": []}
-            print(f"Starting 30 iterations (3 keys x 10 requests)...")
-
+            results = {
+                "1x1": [],
+                "1xM": [],
+                "Nx1": [],
+                "NxM": [],
+                "LLM_ToolCall": []
+            }
+            
+            print("Starting 30 iterations with REAL MCP protocol...")
+            print("=" * 60)
+            
+            client_direct = MCPClient(MCP_SERVER_URL)
+            client_proxied = MCPClient(MCP_SERVER_URL, proxy=PROXY_URL)
+            
             for i in range(30):
-                model = get_model(i)
-                try:
-                    await model.generate_content_async("ping")
-                except:
-                    pass
-
+                key = KEYS[i % len(KEYS)]
+                
+                # Run topology tests
                 results["1x1"].append(await topo_1x1_atomic())
-                results["1xM"].append(await topo_1xM_hub())
-                results["Nx1"].append(await topo_Nx1_competing())
-                results["NxM"].append(await topo_NxM_mesh())
-                if (i + 1) % 5 == 0: print(f"Progress: {i+1}/30")
-
+                results["1xM"].append(await topo_1xM_hub(client_direct))
+                results["Nx1"].append(await topo_Nx1_competing(client_direct))
+                results["NxM"].append(await topo_NxM_mesh(client_proxied))
+                
+                if i % 10 == 0:
+                    success, latency = await test_llm_tool_calling(key, client_direct)
+                    if success:
+                        results["LLM_ToolCall"].append(latency)
+                        print(f"✓ LLM Tool Call successful: {latency:.2f} ms")
+                
+                if (i + 1) % 5 == 0:
+                    print(f"Progress: {i+1}/30")
+                
+                await asyncio.sleep(0.5)  # Rate limiting
+            
+            print("\n" + "=" * 60)
+            print("RESULTS: MCP Protocol Latency Benchmark")
+            print("=" * 60 + "\n")
+            
             table_data = []
             base_mean = np.mean(results["1x1"])
+            
             for key in ["1x1", "1xM", "Nx1", "NxM"]:
                 d = results[key]
                 table_data.append([
-                    key, f"{np.mean(d):.2f}", f"{np.median(d):.2f}",
-                    f"{np.std(d):.2f}", f"{np.percentile(d, 90):.2f}",
-                    f"{np.percentile(d, 99):.2f}", f"{np.mean(d)/base_mean:.1f}x"
+                    key,
+                    f"{np.mean(d):.2f}",
+                    f"{np.median(d):.2f}",
+                    f"{np.std(d):.2f}",
+                    f"{np.percentile(d, 90):.2f}",
+                    f"{np.percentile(d, 99):.2f}",
+                    f"{np.mean(d)/base_mean:.1f}x"
                 ])
-
-            print("\n" + tabulate(table_data,
-                headers=["Topo", "Mean", "Median", "Std", "P90", "P99", "Factor"],
-                tablefmt="grid"))
-
-            plt.figure(figsize=(12, 6))
-            for key in results:
-                plt.plot(results[key], label=key, marker='o', markersize=4)
-            plt.title("Latency Distribution (30 Iters, Gemini 2.0 Flash)")
-            plt.ylabel("Latency (ms)")
-            plt.xlabel("Iteration")
+            
+            # Add LLM results if available
+            if results["LLM_ToolCall"]:
+                d = results["LLM_ToolCall"]
+                table_data.append([
+                    "LLM→MCP",
+                    f"{np.mean(d):.2f}",
+                    f"{np.median(d):.2f}",
+                    f"{np.std(d):.2f}",
+                    f"{np.percentile(d, 90):.2f}",
+                    f"{np.percentile(d, 99):.2f}",
+                    f"{np.mean(d)/base_mean:.1f}x"
+                ])
+            
+            print(tabulate(
+                table_data,
+                headers=["Topology", "Mean(ms)", "Median", "Std", "P90", "P99", "Factor"],
+                tablefmt="grid"
+            ))
+            
+            plt.figure(figsize=(14, 7))
+            
+            for key in ["1x1", "1xM", "Nx1", "NxM"]:
+                plt.plot(results[key], label=key, marker='o', markersize=4, alpha=0.7)
+            
+            if results["LLM_ToolCall"]:
+                llm_indices = [i * 10 for i in range(len(results["LLM_ToolCall"]))]
+                plt.scatter(
+                    llm_indices,
+                    results["LLM_ToolCall"],
+                    label="LLM→MCP",
+                    marker="*",
+                    s=200,
+                    c='red',
+                    edgecolors='black',
+                    zorder=5
+                )
+            
+            plt.title("MCP Protocol Latency: Real Tool Calls (Gemini 2.0 Flash)", fontsize=14)
+            plt.ylabel("Latency (ms)", fontsize=12)
+            plt.xlabel("Iteration", fontsize=12)
             plt.yscale('log')
-            plt.legend()
-            plt.grid(True, which="both", ls="-", alpha=0.5)
-            plt.savefig('/tmp/bench.png')
-
-            print("\n" + "="*50)
-            print("ЭКСПЕРИМЕНТ ЗАВЕРШЕН")
-            print("Запустите эту команду на своем компьютере, чтобы забрать график:")
-            print("kubectl cp mcp-bench/bench-runner:/tmp/bench.png ./bench_results.png")
-            print("="*50 + "\n")
-
+            plt.legend(loc='best', fontsize=10)
+            plt.grid(True, which="both", ls="-", alpha=0.3)
+            plt.tight_layout()
+            plt.savefig('/tmp/mcp_bench_results.png', dpi=150)
+            
+            print("\n" + "=" * 60)
+            print("=" * 60)
+            print("\nTo download results:")
+            print("kubectl cp mcp-bench/bench-runner:/tmp/mcp_bench_results.png ./mcp_results.png")
+            print("=" * 60 + "\n")
+        
         asyncio.run(run())
+        
+        print("Keeping pod alive for 1 hour for log inspection...")
+        time.sleep(3600)
         EOF
+        
         python benchmark.py
-        sleep 3600
